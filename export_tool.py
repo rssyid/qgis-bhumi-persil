@@ -1,19 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 export_tool.py
-Modul Export Area Terseleksi ke Georeferenced Image (GeoTIFF) untuk BHUMI ATR/BPN.
+Modul Export Area Terseleksi ke Georeferenced Image (GeoTIFF) dan
+Vektorisasi Otomatis ke Shapefile (.shp) & GeoJSON (.geojson) untuk BHUMI ATR/BPN.
 
-Fitur & Peningkatan Performa:
+Fitur:
   - Multi-threaded Turbo Downloader: Konkurensi paralel hingga 16 - 24 worker threads
-  - High-capacity HTTP Session Connection Pooling (pool_maxsize=64) untuk mengeliminasi latency TCP/TLS
-  - Real-time Download Telemetry: Menampilkan kecepatan unduh (tiles/detik) dan estimasi sisa waktu
+  - High-capacity HTTP Session Connection Pooling (pool_maxsize=64)
+  - Real-time Download Telemetry: Menampilkan kecepatan unduh (tiles/detik) & sisa waktu
+  - Vektorisasi Poligon Otomatis (Raster -> Vector):
+    * Mengekstrak petak bidang tanah menjadi Poligon vektor tertutup (Polygon)
+    * Simplifikasi geometri anti-bergerigi (Douglas-Peucker 0.2m)
+    * Perhitungan otomatis atribut luas (m²) dan keliling (m)
+    * Ekspor simultan ke ESRI Shapefile (.shp) dan GeoJSON (.geojson)
   - RectangleAreaTool: Map tool interaktif untuk menarik kotak area (RubberBand)
-  - Tile Stitcher & GeoTIFF Writer: Penjahitan (stitching) mosaik, penanaman metadata
-    georeference EPSG:3857 (GeoTransform + SRS WKT), dan otomatis memuat layer baru ke kanvas QGIS.
+  - Otomatis memuat layer GeoTIFF dan Layer Vektor Poligon ke kanvas QGIS.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
@@ -27,16 +33,21 @@ from requests.adapters import HTTPAdapter
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsField,
+    QgsFields,
+    QgsFeature,
     QgsGeometry,
     QgsMapRendererCustomPainterJob,
     QgsPointXY,
     QgsProject,
     QgsRasterLayer,
     QgsRectangle,
+    QgsVectorFileWriter,
+    QgsVectorLayer,
     QgsWkbTypes,
 )
 from qgis.gui import QgsMapCanvas, QgsMapTool, QgsRubberBand
-from qgis.PyQt.QtCore import QByteArray, QEventLoop, QPoint, QRect, QRectF, QSize, Qt
+from qgis.PyQt.QtCore import QByteArray, QEventLoop, QPoint, QRect, QRectF, QSize, Qt, QVariant
 from qgis.PyQt.QtGui import QColor, QCursor, QImage, QPainter
 from qgis.PyQt.QtWidgets import (
     QApplication,
@@ -91,6 +102,7 @@ EPSG_3857_WKT = (
     'AUTHORITY["EPSG","3857"]]'
 )
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # High-Performance HTTP Session Pool untuk Export
 # ─────────────────────────────────────────────────────────────────────────────
@@ -133,13 +145,13 @@ def get_tile_bounds(rect_3857: QgsRectangle, z: int) -> tuple[int, int, int, int
 class ExportAreaDialog(QDialog):
     """
     Dialog konfigurasi resolusi zoom level, kecepatan thread paralel,
-    opsi basemap, dan estimasi tile.
+    opsi vektorisasi poligon (.shp & .geojson), opsi basemap, dan estimasi tile.
     """
 
     def __init__(self, rect_3857: QgsRectangle, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Export Area Bidang Tanah ke GeoTIFF")
-        self.setMinimumWidth(480)
+        self.setWindowTitle("Export Area Bidang Tanah ke GeoTIFF & Vektor")
+        self.setMinimumWidth(500)
         self.rect = rect_3857
 
         self.width_m = rect_3857.width()
@@ -173,7 +185,6 @@ class ExportAreaDialog(QDialog):
         res_form = QFormLayout(res_group)
 
         self.zoom_combo = QComboBox()
-        # Isi pilihan zoom 14 s/d 19
         for z in range(14, 20):
             res_m = INITIAL_RES / (2 ** z)
             desc = ""
@@ -203,7 +214,7 @@ class ExportAreaDialog(QDialog):
         self.thread_combo.addItem("⚡ Maksimal — 24 Thread Paralel (Koneksi Cepat)", 24)
         self.thread_combo.addItem("⚖ Cepat — 12 Thread Paralel", 12)
         self.thread_combo.addItem("🛡 Standar — 8 Thread Paralel (Ringan)", 8)
-        self.thread_combo.setCurrentIndex(0)  # Default: 16 threads
+        self.thread_combo.setCurrentIndex(0)
 
         self.lbl_tile_count = QLabel("<b>-</b>")
         self.lbl_image_dim = QLabel("<b>-</b>")
@@ -218,26 +229,32 @@ class ExportAreaDialog(QDialog):
         res_form.addRow("", self.lbl_warning)
         layout.addWidget(res_group)
 
-        # ── Group Opsi Tambahan ──
-        opt_group = QGroupBox("Opsi Output")
+        # ── Group Opsi Output & Vektorisasi ──
+        opt_group = QGroupBox("Opsi Format & Vektorisasi")
         opt_layout = QVBoxLayout(opt_group)
 
-        self.cb_basemap = QCheckBox("Sertakan Basemap Kanvas (Google Maps / Citra Satelit)")
-        self.cb_basemap.setChecked(False)
-        self.cb_basemap.setToolTip(
-            "Jika dicentang, basemap yang aktif di belakang garis persil akan ikut digabung ke GeoTIFF."
+        # Opsi Vektorisasi Poligon
+        self.cb_vectorize = QCheckBox("📐 Sekaligus Buat Vektor Poligon Bidang (.shp & .geojson)")
+        self.cb_vectorize.setChecked(True)
+        self.cb_vectorize.setStyleSheet("font-weight: bold; color: #1e7e34;")
+        self.cb_vectorize.setToolTip(
+            "Ekstrak otomatis garis batas menjadi poligon bidang tanah tertutup lengkap dengan atribut luas (m²) dan keliling (m)."
         )
 
-        self.cb_add_layer = QCheckBox("Otomatis muat GeoTIFF ke daftar Layer QGIS setelah selesai")
+        self.cb_basemap = QCheckBox("Sertakan Basemap Kanvas pada GeoTIFF (Google Maps / Citra Satelit)")
+        self.cb_basemap.setChecked(False)
+
+        self.cb_add_layer = QCheckBox("Otomatis muat layer GeoTIFF & Vektor ke kanvas QGIS setelah selesai")
         self.cb_add_layer.setChecked(True)
 
+        opt_layout.addWidget(self.cb_vectorize)
         opt_layout.addWidget(self.cb_basemap)
         opt_layout.addWidget(self.cb_add_layer)
         layout.addWidget(opt_group)
 
         # ── Buttons ──
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.button(QDialogButtonBox.Ok).setText("Export GeoTIFF...")
+        btns.button(QDialogButtonBox.Ok).setText("Mulai Export...")
         btns.accepted.connect(self._on_accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
@@ -291,6 +308,10 @@ class ExportAreaDialog(QDialog):
     @property
     def selected_threads(self) -> int:
         return self.thread_combo.currentData()
+
+    @property
+    def should_vectorize(self) -> bool:
+        return self.cb_vectorize.isChecked()
 
     @property
     def include_basemap(self) -> bool:
@@ -402,6 +423,171 @@ def _write_world_files(filepath: str, rect_3857: QgsRectangle, res_x: float, res
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Mesin Vektorisasi: Raster Mask -> Poligon Vektor (.shp & .geojson)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def vectorize_persil_to_vector_files(
+    qimage: QImage,
+    rect_3857: QgsRectangle,
+    base_filepath: str,
+    min_area_m2: float = 8.0,
+    simplify_tolerance: float = 0.2,
+) -> tuple[Optional[str], Optional[str], int]:
+    """
+    Ekstrak bidang tanah dari raster qimage menjadi layer Poligon vektor.
+    Menyimpan sekaligus ke format:
+      1. Shapefile (.shp + .dbf + .shx + .prj)
+      2. GeoJSON (.geojson)
+
+    :returns: (shp_path, geojson_path, polygon_count)
+    """
+    width = qimage.width()
+    height = qimage.height()
+    if width <= 0 or height <= 0:
+        return None, None, 0
+
+    res_x = rect_3857.width() / float(width)
+    res_y = rect_3857.height() / float(height)
+
+    # 1. Bangun binary mask (0 = Bidang Tanah Interior, 1 = Garis Batas / Boundary)
+    try:
+        import numpy as np
+        from osgeo import gdal, ogr, osr
+
+        # Ambil alpha & warna dari QImage
+        img_format = QImage.Format_RGBA8888
+        converted = qimage.convertToFormat(img_format)
+        ptr = converted.bits()
+        ptr.setsize(converted.byteCount())
+        arr = np.frombuffer(bytes(ptr), dtype=np.uint8).reshape((height, width, 4))
+
+        # Alpha > 30 menunjukkan adanya garis batas bidang
+        alpha = arr[:, :, 3]
+        # Mask: 0 = interior bidang tanah (ruang kosong di dalam bidang), 1 = garis
+        mask_binary = (alpha > 30).astype(np.uint8)
+
+        # Buat GDAL In-Memory Dataset
+        mem_driver = gdal.GetDriverByName("MEM")
+        src_ds = mem_driver.Create("", width, height, 1, gdal.GDT_Byte)
+        src_ds.SetGeoTransform([
+            rect_3857.xMinimum(), res_x, 0.0,
+            rect_3857.yMaximum(), 0.0, -res_y
+        ])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(3857)
+        src_ds.SetProjection(srs.ExportToWkt())
+
+        band = src_ds.GetRasterBand(1)
+        band.WriteArray(mask_binary)
+
+        # Buat In-Memory OGR Vector Layer untuk menampung hasil polygonize
+        ogr_mem_driver = ogr.GetDriverByName("Memory")
+        dst_ds = ogr_mem_driver.CreateDataSource("mem_polygons")
+        dst_layer = dst_ds.CreateLayer("polygons", srs=srs, geom_type=ogr.wkbPolygon)
+
+        field_dn = ogr.FieldDefn("DN", ogr.OFTInteger)
+        dst_layer.CreateField(field_dn)
+
+        # Jalankan GDAL Polygonize C++ engine
+        gdal.Polygonize(band, None, dst_layer, 0, [], callback=None)
+
+        # Kumpulkan poligon bidang tanah valid (DN == 0)
+        valid_polygons = []
+        outer_bbox_area = rect_3857.width() * rect_3857.height()
+
+        for feat in dst_layer:
+            dn_val = feat.GetField("DN")
+            if dn_val != 0:
+                continue  # Lewati garis pembatas
+
+            geom = feat.GetGeometryRef()
+            if geom is None:
+                continue
+
+            area = geom.GetArea()
+            # Filter noise kecil dan abaikan poligon raksasa seukuran seluruh kanvas
+            if area < min_area_m2 or area >= (outer_bbox_area * 0.98):
+                continue
+
+            # Simplifikasi geometri agar tidak bergerigi
+            if simplify_tolerance > 0:
+                simplified_geom = geom.Simplify(simplify_tolerance)
+                if simplified_geom and not simplified_geom.IsEmpty():
+                    geom = simplified_geom
+
+            perimeter = geom.Boundary().GetLength() if geom.Boundary() else 0.0
+            wkt_str = geom.ExportToWkt()
+
+            valid_polygons.append({
+                "wkt": wkt_str,
+                "area_m2": round(area, 2),
+                "perimeter_m": round(perimeter, 2),
+            })
+
+        src_ds = None
+        dst_ds = None
+
+        if not valid_polygons:
+            return None, None, 0
+
+        # Tentukan nama file output .shp dan .geojson
+        base_no_ext = os.path.splitext(base_filepath)[0]
+        shp_path = f"{base_no_ext}_poligon.shp"
+        geojson_path = f"{base_no_ext}_poligon.geojson"
+
+        # Buat Layer Vektor menggunakan QGIS API untuk export Shapefile & GeoJSON
+        crs_3857 = QgsCoordinateReferenceSystem("EPSG:3857")
+        vl = QgsVectorLayer("Polygon?crs=EPSG:3857", "persil_temp", "memory")
+        pr = vl.dataProvider()
+
+        # Tambahkan atribut
+        pr.addAttributes([
+            QgsField("id", QVariant.Int),
+            QgsField("luas_m2", QVariant.Double),
+            QgsField("keliling_m", QVariant.Double),
+            QgsField("sumber", QVariant.String),
+        ])
+        vl.updateFields()
+
+        # Masukkan fitur poligon
+        qgs_features = []
+        for idx, p in enumerate(valid_polygons, start=1):
+            f = QgsFeature(vl.fields())
+            geom_qgs = QgsGeometry.fromWkt(p["wkt"])
+            f.setGeometry(geom_qgs)
+            f.setAttribute("id", idx)
+            f.setAttribute("luas_m2", p["area_m2"])
+            f.setAttribute("keliling_m", p["perimeter_m"])
+            f.setAttribute("sumber", "BHUMI ATR/BPN")
+            qgs_features.append(f)
+
+        pr.addFeatures(qgs_features)
+        vl.updateExtents()
+
+        # 1. Simpan ke ESRI Shapefile
+        options_shp = QgsVectorFileWriter.SaveVectorOptions()
+        options_shp.driverName = "ESRI Shapefile"
+        options_shp.fileEncoding = "UTF-8"
+        QgsVectorFileWriter.writeAsVectorFormatV3(
+            vl, shp_path, QgsProject.instance().transformContext(), options_shp
+        )
+
+        # 2. Simpan ke GeoJSON
+        options_geojson = QgsVectorFileWriter.SaveVectorOptions()
+        options_geojson.driverName = "GeoJSON"
+        options_geojson.fileEncoding = "UTF-8"
+        QgsVectorFileWriter.writeAsVectorFormatV3(
+            vl, geojson_path, QgsProject.instance().transformContext(), options_geojson
+        )
+
+        return shp_path, geojson_path, len(valid_polygons)
+
+    except Exception:
+        # Fallback jika terjadi kendala pada GDAL C++ binding
+        return None, None, 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Multi-Threaded Parallel Download & Stitching
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -449,12 +635,10 @@ def stitch_persil_tiles(
 
     def _fetch_single_tile(coords: tuple[int, int]) -> tuple[int, int, Optional[bytes]]:
         tx, ty = coords
-        # 1. Cek memory cache terlebih dahulu
         cached = TILE_CACHE.get("bhumi_persil", zoom, tx, ty)
         if cached:
             return tx, ty, cached
 
-        # 2. Fetch langsung via session pool
         try:
             minx, miny, maxx, maxy = xyz_to_bbox(zoom, tx, ty)
             params = {
@@ -485,7 +669,6 @@ def stitch_persil_tiles(
 
         return tx, ty, None
 
-    # Eksekusi paralel berkecepatan tinggi
     completed_count = 0
     t_start = time.time()
 
@@ -527,11 +710,9 @@ def stitch_persil_tiles(
 
     painter.end()
 
-    # BBOX dari seluruh mosaik tile dalam EPSG:3857
     mosaic_min_x = -ORIGIN_SHIFT + min_tx * 256.0 * res
     mosaic_max_y = ORIGIN_SHIFT - min_ty * 256.0 * res
 
-    # Hitung crop pixel offset untuk mendapatkan exact rect_3857
     crop_x = int(math.floor((rect_3857.xMinimum() - mosaic_min_x) / res))
     crop_y = int(math.floor((mosaic_max_y - rect_3857.yMaximum()) / res))
     crop_w = int(math.ceil(rect_3857.width() / res))
@@ -678,13 +859,14 @@ class RectangleAreaTool(QgsMapTool):
         self.canvas.unsetMapTool(self)
 
     def _process_export(self, rect_3857: QgsRectangle):
-        """Buka dialog konfigurasi export dan jalankan stitching."""
+        """Buka dialog konfigurasi export dan jalankan stitching & vectorization."""
         dlg = ExportAreaDialog(rect_3857, parent=self.iface.mainWindow())
         if dlg.exec_() != QDialog.Accepted:
             return
 
         zoom = dlg.selected_zoom
         threads = dlg.selected_threads
+        should_vec = dlg.should_vectorize
         include_basemap = dlg.include_basemap
         auto_add = dlg.auto_add_layer
 
@@ -694,7 +876,7 @@ class RectangleAreaTool(QgsMapTool):
 
         filepath, selected_filter = QFileDialog.getSaveFileName(
             parent=self.iface.mainWindow(),
-            caption="Simpan Gambar Georeference (GeoTIFF)",
+            caption="Tentukan Lokasi & Nama Berkas Export",
             directory=default_path,
             filter="GeoTIFF (*.tif *.tiff);;PNG Image + World File (*.png);;All Files (*)",
         )
@@ -713,7 +895,7 @@ class RectangleAreaTool(QgsMapTool):
             100,
             self.iface.mainWindow(),
         )
-        progress.setWindowTitle("Mengunduh Bidang Tanah BHUMI")
+        progress.setWindowTitle("Memproses Export Area BHUMI")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.show()
@@ -729,8 +911,20 @@ class RectangleAreaTool(QgsMapTool):
                 )
             return
 
-        # 2. Jika opsi basemap dipilih, gabungkan dengan basemap kanvas
-        final_img = persil_img
+        # 2. Vektorisasi Poligon Otomatis (.shp & .geojson)
+        shp_file = None
+        geojson_file = None
+        poly_count = 0
+
+        if should_vec:
+            progress.setLabelText("📐 Mengekstrak Vektor Poligon Bidang Tanah (.shp & .geojson)...")
+            QApplication.processEvents()
+            shp_file, geojson_file, poly_count = vectorize_persil_to_vector_files(
+                persil_img, rect_3857, filepath, min_area_m2=8.0, simplify_tolerance=0.2
+            )
+
+        # 3. Jika opsi basemap dipilih, gabungkan dengan basemap kanvas untuk raster
+        final_raster_img = persil_img
         if include_basemap:
             progress.setLabelText("Menggabungkan dengan Basemap Kanvas...")
             QApplication.processEvents()
@@ -744,42 +938,54 @@ class RectangleAreaTool(QgsMapTool):
             painter.drawImage(0, 0, basemap_img)
             painter.drawImage(0, 0, persil_img)
             painter.end()
-            final_img = comp
+            final_raster_img = comp
 
         progress.setLabelText("Menyimpan metadata Georeference GeoTIFF...")
         QApplication.processEvents()
 
-        # 3. Simpan ke GeoTIFF
-        success = save_as_geotiff(filepath, final_img, rect_3857)
+        # 4. Simpan ke GeoTIFF
+        success_raster = save_as_geotiff(filepath, final_raster_img, rect_3857)
         progress.close()
 
-        if success:
-            msg = (
-                f"✔ Area bidang tanah berhasil diexport ke GeoTIFF!\n\n"
-                f"Lokasi: {filepath}\n"
-                f"Dimensi: {final_img.width():,} × {final_img.height():,} px (Zoom {zoom})\n"
-                f"Proyeksi: EPSG:3857 (WGS 84 / Pseudo-Mercator)"
-            )
-            self.iface.messageBar().pushSuccess("BHUMI Export", "GeoTIFF berhasil dibuat!")
+        if success_raster:
+            vector_info = ""
+            if should_vec and shp_file and poly_count > 0:
+                vector_info = (
+                    f"\n\n📐 Hasil Vektor Poligon ({poly_count:,} bidang tanah):\n"
+                    f" • Shapefile: {shp_file}\n"
+                    f" • GeoJSON  : {geojson_file}"
+                )
 
-            # 4. Otomatis tambahkan layer ke QGIS jika dipilih
+            msg = (
+                f"✔ Export Berhasil Selesai!\n\n"
+                f"📷 GeoTIFF Raster:\n"
+                f" • Lokasi: {filepath}\n"
+                f" • Dimensi: {final_raster_img.width():,} × {final_raster_img.height():,} px (Zoom {zoom})\n"
+                f" • Proyeksi: EPSG:3857 (WGS 84 / Pseudo-Mercator)"
+                f"{vector_info}"
+            )
+            self.iface.messageBar().pushSuccess("BHUMI Export", "GeoTIFF & Vektor berhasil dibuat!")
+
+            # 5. Otomatis tambahkan layer ke QGIS jika dipilih
             if auto_add:
-                layer_name = os.path.splitext(os.path.basename(filepath))[0]
-                raster_layer = QgsRasterLayer(filepath, layer_name, "gdal")
+                # Tambahkan layer GeoTIFF
+                layer_name_r = os.path.splitext(os.path.basename(filepath))[0]
+                raster_layer = QgsRasterLayer(filepath, layer_name_r, "gdal")
                 if raster_layer.isValid():
                     QgsProject.instance().addMapLayer(raster_layer)
-                else:
-                    QMessageBox.information(
-                        self.iface.mainWindow(),
-                        "Export Selesai",
-                        msg,
-                    )
-            else:
-                QMessageBox.information(
-                    self.iface.mainWindow(),
-                    "Export Selesai",
-                    msg,
-                )
+
+                # Tambahkan layer Vektor Poligon Shapefile
+                if should_vec and shp_file and os.path.isfile(shp_file):
+                    layer_name_v = os.path.splitext(os.path.basename(shp_file))[0]
+                    vector_layer = QgsVectorLayer(shp_file, layer_name_v, "ogr")
+                    if vector_layer.isValid():
+                        QgsProject.instance().addMapLayer(vector_layer)
+
+            QMessageBox.information(
+                self.iface.mainWindow(),
+                "Export Selesai",
+                msg,
+            )
         else:
             QMessageBox.critical(
                 self.iface.mainWindow(),

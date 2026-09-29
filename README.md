@@ -29,6 +29,12 @@ Plugin QGIS mandiri untuk memuat dan mengunduh bidang tanah resmi **BHUMI ATR/BP
    - Opsi penggabungan garis persil dengan basemap kanvas aktif (Google Satellite / OSM).
    - Menghasilkan berkas **GeoTIFF (`.tif`)** berstandar GIS dengan proyeksi **EPSG:3857** lengkap dengan World File pendamping (`.tfw` & `.prj`).
 
+5. **📐 Vektorisasi Poligon Otomatis (Simultan ke .SHP & .GeoJSON)**
+   - Saat mengekspor GeoTIFF, sistem sekaligus dapat mengekstrak petak bidang tanah menjadi **Poligon Vektor Tertutup (*Polygon*)**.
+   - Dilengkapi algoritma *anti-bergerigi* (*Douglas-Peucker simplification*).
+   - Menghitung otomatis atribut **Luas Bidang ($m^2$)** dan **Keliling ($m$)**.
+   - Menghasilkan dua berkas vektor sekaligus: **ESRI Shapefile (`.shp`)** dan **GeoJSON (`.geojson`)**, serta langsung memuat layernya ke kanvas QGIS!
+
 ---
 
 ## 🚀 Panduan Instalasi
