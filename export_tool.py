@@ -533,25 +533,25 @@ def _classify_polygon_by_color(
             ir, ig, ib = median_rgb[0], median_rgb[1], median_rgb[2]
 
         # ── Evaluasi Kategori Legenda BHUMI ATR/BPN ──
-        # A. Hak Pengelolaan (Garis Merah Pekat)
+        # A. Hak Pengelolaan (Garis / Area Merah Pekat)
         if (sr > 190 and sg < 70 and sb < 70) or (ir > 190 and ig < 70 and ib < 70):
             return "Hak Pengelolaan", "#FF0000", "Tidak"
 
-        # B. Belum Terdaftar (Garis/Area Hijau)
+        # B. Belum Terdaftar (Garis / Area Hijau)
         if (sg > sr + 15 and sg > sb + 15) or (sg > 140 and sr < 160 and sb < 160) or (ig > ir + 15 and ig > ib + 15):
             return "Belum Terdaftar", "#81C784", "Tidak"
 
-        # C. Unsur Geografis (Garis/Area Biru)
+        # C. Unsur Geografis (Garis / Area Biru)
         if (sb > sr + 15 and sb > sg + 10) or (sb > 150 and sr < 140) or (ib > ir + 15 and ib > ig + 10):
             return "Unsur Geografis", "#6C8EBF", "Tidak"
 
-        # D. Kawasan Terdaftar / Tumpang Tindih (Kuning Emas Pekat / Oranye Coklat)
-        if (sr > 210 and 125 <= sg <= 185 and sb < 80) or (ir > 200 and 125 <= ig <= 185 and ib < 80):
-            return "Kawasan Terdaftar", "#E5A024", "Ya"
-
-        # E. Bidang Terdaftar (Kuning Standar)
-        if sr > 190 and sg > 150:
+        # D. Bidang Terdaftar (Kuning Standar ATR/BPN: R > 190, G > 160)
+        if (ir > 190 and ig > 160) or (sr > 190 and sg > 160):
             return "Bidang Terdaftar", "#F5C258", "Tidak"
+
+        # E. Kawasan Terdaftar / Tumpang Tindih (Kuning Emas Pekat / Oranye Coklat)
+        if (sr > 200 and 110 <= sg <= 185 and sb < 80) or (ir > 190 and 110 <= ig <= 185 and ib < 80):
+            return "Kawasan Terdaftar", "#E5A024", "Ya"
 
     except Exception:
         pass
@@ -659,7 +659,8 @@ def vectorize_persil_to_vector_files(
 
         for feat in dst_layer:
             dn_val = feat.GetField("DN")
-            if dn_val != 0:
+            # Ambil DN == 1 (area bidang tanah yang memiliki piksel warna / non-transparan)
+            if dn_val != 1:
                 continue
 
             geom = feat.GetGeometryRef()
@@ -667,30 +668,8 @@ def vectorize_persil_to_vector_files(
                 continue
 
             area = geom.GetArea()
-            if area < min_area_m2 or area >= (outer_bbox_area * 0.98):
+            if area < min_area_m2 or area >= (outer_bbox_area * 0.999):
                 continue
-
-            # Verifikasi apakah keliling poligon dikelilingi oleh garis batas (stroke lines)
-            boundary = geom.Boundary()
-            if boundary:
-                boundary_points = []
-                pt_count = boundary.GetPointCount()
-                step = max(1, pt_count // 80)
-                for i in range(0, pt_count, step):
-                    pt = boundary.GetPoint(i)
-                    px = int((pt[0] - rect_3857.xMinimum()) / res_x)
-                    py = int((rect_3857.yMaximum() - pt[1]) / res_y)
-                    px = max(0, min(px, width - 1))
-                    py = max(0, min(py, height - 1))
-                    boundary_points.append(arr[py, px])
-
-                if boundary_points:
-                    b_arr = np.array(boundary_points)
-                    stroke_hits = np.sum(b_arr[:, 3] > 30)
-                    stroke_ratio = stroke_hits / max(1, len(boundary_points))
-                    # Abaikan poligon canvas background luar yang tidak memiliki stroke pembatas
-                    if stroke_ratio < 0.5:
-                        continue
 
             # Klasifikasikan status & warna berdasarkan legenda resmi BHUMI
             status, kode_warna, is_overlap = _classify_polygon_by_color(
