@@ -31,6 +31,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from qgis.core import (
+    Qgis,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsField,
@@ -38,6 +39,7 @@ from qgis.core import (
     QgsFeature,
     QgsGeometry,
     QgsMapRendererCustomPainterJob,
+    QgsMessageLog,
     QgsPointXY,
     QgsProject,
     QgsRasterLayer,
@@ -47,7 +49,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from qgis.gui import QgsMapCanvas, QgsMapTool, QgsRubberBand
-from qgis.PyQt.QtCore import QByteArray, QEventLoop, QPoint, QRect, QRectF, QSize, Qt, QVariant
+from qgis.PyQt.QtCore import QBuffer, QByteArray, QEventLoop, QIODevice, QPoint, QRect, QRectF, QSize, Qt, QVariant
 from qgis.PyQt.QtGui import QColor, QCursor, QImage, QPainter
 from qgis.PyQt.QtWidgets import (
     QApplication,
@@ -323,6 +325,52 @@ class ExportAreaDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Helper Konversi QImage ke RGBA NumPy Array (Aman Tanpa sip.voidptr)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def qimage_to_rgba_array(qimage: QImage):
+    """
+    Konversi QImage ke numpy array berdimensi (height, width, 4) uint8 RGBA.
+    Menggunakan in-memory QBuffer dan GDAL Virtual Filesystem (/vsimem/)
+    yang 100% aman dan kompatibel di semua versi PyQt5, PyQt6, dan Python 3.
+    """
+    import uuid
+    import numpy as np
+    from osgeo import gdal
+
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.WriteOnly)
+    qimage.save(buf, "PNG")
+    png_bytes = bytes(ba.data())
+    buf.close()
+
+    mem_vsi = f"/vsimem/qimg_{uuid.uuid4().hex}.png"
+    gdal.FileFromMemBuffer(mem_vsi, png_bytes)
+    try:
+        ds = gdal.Open(mem_vsi)
+        if ds is not None:
+            raw = ds.ReadAsArray()
+            ds = None
+            if raw is not None:
+                if raw.ndim == 3:
+                    # (bands, height, width) -> (height, width, bands)
+                    arr = np.transpose(raw, (1, 2, 0))
+                    if arr.shape[2] == 3:
+                        alpha = np.full((arr.shape[0], arr.shape[1], 1), 255, dtype=np.uint8)
+                        arr = np.concatenate([arr, alpha], axis=2)
+                    return arr
+                elif raw.ndim == 2:
+                    arr = np.stack([raw, raw, raw, np.full_like(raw, 255)], axis=2)
+                    return arr
+    except Exception as e:
+        QgsMessageLog.logMessage(f"Gagal konversi QImage ke Array: {e}", "BHUMI ATR/BPN", Qgis.Warning)
+    finally:
+        gdal.Unlink(mem_vsi)
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Writer GeoTIFF & World File
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -341,49 +389,50 @@ def save_as_geotiff(
     res_x = rect_3857.width() / float(width)
     res_y = rect_3857.height() / float(height)
 
-    # 1. Coba menggunakan GDAL jika tersedia di environment QGIS
+    # 1. Coba menggunakan GDAL dengan compression DEFLATE & GeoTransform
     try:
         from osgeo import gdal, osr
 
-        driver = gdal.GetDriverByName("GTiff")
-        if driver is not None:
-            img_format = QImage.Format_RGBA8888
-            converted = qimage.convertToFormat(img_format)
-            ptr = converted.bits()
-            ptr.setsize(converted.byteCount())
-            raw_bytes = bytes(ptr)
+        arr = qimage_to_rgba_array(qimage)
+        if arr is not None:
+            driver = gdal.GetDriverByName("GTiff")
+            if driver is not None:
+                ds = driver.Create(
+                    filepath,
+                    width,
+                    height,
+                    4,
+                    gdal.GDT_Byte,
+                    ["COMPRESS=DEFLATE", "TILED=YES"],
+                )
+                if ds is not None:
+                    geotransform = [
+                        rect_3857.xMinimum(),
+                        res_x,
+                        0.0,
+                        rect_3857.yMaximum(),
+                        0.0,
+                        -res_y,
+                    ]
+                    ds.SetGeoTransform(geotransform)
 
-            ds = driver.Create(filepath, width, height, 4, gdal.GDT_Byte, ["COMPRESS=DEFLATE"])
-            if ds is not None:
-                geotransform = [
-                    rect_3857.xMinimum(),
-                    res_x,
-                    0.0,
-                    rect_3857.yMaximum(),
-                    0.0,
-                    -res_y,
-                ]
-                ds.SetGeoTransform(geotransform)
+                    srs = osr.SpatialReference()
+                    srs.ImportFromEPSG(3857)
+                    ds.SetProjection(srs.ExportToWkt())
 
-                srs = osr.SpatialReference()
-                srs.ImportFromEPSG(3857)
-                ds.SetProjection(srs.ExportToWkt())
+                    for band_idx in range(4):
+                        band = ds.GetRasterBand(band_idx + 1)
+                        band.WriteArray(arr[:, :, band_idx])
 
-                import numpy as np
-                arr = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((height, width, 4))
-                for band_idx in range(4):
-                    band = ds.GetRasterBand(band_idx + 1)
-                    band.WriteArray(arr[:, :, band_idx])
+                    ds.FlushCache()
+                    ds = None
 
-                ds.FlushCache()
-                ds = None
+                    _write_world_files(filepath, rect_3857, res_x, res_y)
+                    return True
+    except Exception as e:
+        QgsMessageLog.logMessage(f"GeoTIFF GDAL export warning: {e}", "BHUMI ATR/BPN", Qgis.Warning)
 
-                _write_world_files(filepath, rect_3857, res_x, res_y)
-                return True
-    except Exception:
-        pass
-
-    # 2. Fallback jika GDAL native Python bindings bermasalah
+    # 2. Fallback jika GDAL direct creation bermasalah
     success = qimage.save(filepath, "TIFF")
     if not success:
         if not filepath.lower().endswith(".png"):
@@ -436,60 +485,72 @@ def _classify_polygon_by_color(
     img_h: int,
 ) -> tuple[str, str, str]:
     """
-    Klasifikasikan poligon berdasarkan sampel warna piksel interior & boundary.
+    Klasifikasikan poligon berdasarkan sampel warna piksel boundary garis batas & interior.
     :returns: (status, kode_warna, is_overlap)
     """
+    import numpy as np
+
     try:
-        # Ambil centroid poligon
+        # 1. Sampel warna pada garis batas keliling (Boundary stroke)
+        boundary = geom.Boundary()
+        boundary_points = []
+        if boundary:
+            pt_count = boundary.GetPointCount()
+            step = max(1, pt_count // 60)
+            for i in range(0, pt_count, step):
+                pt = boundary.GetPoint(i)
+                px = int((pt[0] - rect_3857.xMinimum()) / res_x)
+                py = int((rect_3857.yMaximum() - pt[1]) / res_y)
+                px = max(0, min(px, img_w - 1))
+                py = max(0, min(py, img_h - 1))
+                boundary_points.append(rgba_arr[py, px])
+
+        sr, sg, sb, sa = 0, 0, 0, 0
+        if boundary_points:
+            b_arr = np.array(boundary_points)
+            stroke_hits = b_arr[b_arr[:, 3] > 30]
+            if len(stroke_hits) > 0:
+                median_stroke = np.median(stroke_hits, axis=0)
+                sr, sg, sb, sa = median_stroke[0], median_stroke[1], median_stroke[2], median_stroke[3]
+
+        # 2. Sampel warna interior di sekitar centroid
         centroid = geom.Centroid()
-        if centroid is None:
-            return "Bidang Terdaftar", "#F5C258", "Tidak"
+        ir, ig, ib, ia = 0, 0, 0, 0
+        if centroid is not None:
+            cx = centroid.GetX()
+            cy = centroid.GetY()
+            cpx = max(0, min(int((cx - rect_3857.xMinimum()) / res_x), img_w - 1))
+            cpy = max(0, min(int((rect_3857.yMaximum() - cy) / res_y), img_h - 1))
 
-        cx = centroid.GetX()
-        cy = centroid.GetY()
+            samples = []
+            for dx in range(-2, 3):
+                for dy in range(-2, 3):
+                    sx = max(0, min(cpx + dx, img_w - 1))
+                    sy = max(0, min(cpy + dy, img_h - 1))
+                    samples.append(rgba_arr[sy, sx])
+            samples_arr = np.array(samples)
+            median_rgb = np.median(samples_arr[:, :3], axis=0)
+            ir, ig, ib = median_rgb[0], median_rgb[1], median_rgb[2]
 
-        # Konversi koordinat dunia EPSG:3857 ke koordinat piksel
-        px = int((cx - rect_3857.xMinimum()) / res_x)
-        py = int((rect_3857.yMaximum() - cy) / res_y)
-
-        # Kumpulkan sampel piksel interior (area 5x5 di sekitar centroid)
-        samples = []
-        for dx in range(-3, 4):
-            for dy in range(-3, 4):
-                sx = max(0, min(px + dx, img_w - 1))
-                sy = max(0, min(py + dy, img_h - 1))
-                samples.append(rgba_arr[sy, sx])
-
-        import numpy as np
-        samples_arr = np.array(samples)
-        median_rgb = np.median(samples_arr[:, :3], axis=0)
-        r, g, b = median_rgb[0], median_rgb[1], median_rgb[2]
-
-        # Cek sampel boundary garis batas terdekat
-        env = geom.GetEnvelope()
-        min_px = max(0, int((env[0] - rect_3857.xMinimum()) / res_x))
-        max_py = min(img_h - 1, int((rect_3857.yMaximum() - env[2]) / res_y))
-        stroke_sample = rgba_arr[max_py, min_px]
-        sr, sg, sb, sa = stroke_sample
-
-        # 1. Hak Pengelolaan (Garis Merah Pekat)
-        if (sr > 190 and sg < 60 and sb < 60) or (r > 190 and g < 60 and b < 60):
+        # ── Evaluasi Kategori Legenda BHUMI ATR/BPN ──
+        # A. Hak Pengelolaan (Garis Merah Pekat)
+        if (sr > 190 and sg < 70 and sb < 70) or (ir > 190 and ig < 70 and ib < 70):
             return "Hak Pengelolaan", "#FF0000", "Tidak"
 
-        # 2. Belum Terdaftar (Hijau)
-        if (g > r + 15 and g > b + 15) or (g > 140 and r < 160 and b < 160):
+        # B. Belum Terdaftar (Garis/Area Hijau)
+        if (sg > sr + 15 and sg > sb + 15) or (sg > 140 and sr < 160 and sb < 160) or (ig > ir + 15 and ig > ib + 15):
             return "Belum Terdaftar", "#81C784", "Tidak"
 
-        # 3. Unsur Geografis (Biru / Cyan)
-        if (b > r + 15 and b > g + 10) or (b > 150 and r < 140):
+        # C. Unsur Geografis (Garis/Area Biru)
+        if (sb > sr + 15 and sb > sg + 10) or (sb > 150 and sr < 140) or (ib > ir + 15 and ib > ig + 10):
             return "Unsur Geografis", "#6C8EBF", "Tidak"
 
-        # 4. Kawasan Terdaftar / Tumpang Tindih (Kuning Emas Pekat / Oranye)
-        if r > 210 and 130 <= g <= 185 and b < 80:
+        # D. Kawasan Terdaftar / Tumpang Tindih (Kuning Emas Pekat / Oranye Coklat)
+        if (sr > 210 and 125 <= sg <= 185 and sb < 80) or (ir > 200 and 125 <= ig <= 185 and ib < 80):
             return "Kawasan Terdaftar", "#E5A024", "Ya"
 
-        # 5. Bidang Terdaftar (Kuning Standar)
-        if r > 200 and g > 165:
+        # E. Bidang Terdaftar (Kuning Standar)
+        if sr > 190 and sg > 150:
             return "Bidang Terdaftar", "#F5C258", "Tidak"
 
     except Exception:
@@ -508,17 +569,15 @@ def apply_bhumi_symbology(layer: QgsVectorLayer):
             QgsCategorizedSymbolRenderer,
             QgsFillSymbol,
             QgsRendererCategory,
-            QgsSimpleFillSymbolLayer,
-            QgsSymbol,
         )
 
         categories_def = [
-            ("Bidang Terdaftar", QColor(245, 194, 88, 150), QColor(212, 136, 6, 255), 0.4),
-            ("Belum Terdaftar", QColor(129, 199, 132, 160), QColor(56, 142, 60, 255), 0.4),
+            ("Bidang Terdaftar", QColor(245, 194, 88, 140), QColor(212, 136, 6, 255), 0.5),
+            ("Belum Terdaftar", QColor(129, 199, 132, 150), QColor(56, 142, 60, 255), 0.5),
             ("Hak Pengelolaan", QColor(255, 0, 0, 40), QColor(255, 0, 0, 255), 1.2),
-            ("Kawasan Terdaftar", QColor(229, 160, 36, 160), QColor(212, 107, 8, 255), 0.6),
-            ("Unsur Geografis", QColor(108, 142, 191, 150), QColor(29, 57, 196, 255), 0.4),
-            ("Tumpang Tindih", QColor(255, 140, 0, 180), QColor(178, 34, 34, 255), 0.8),
+            ("Kawasan Terdaftar", QColor(229, 160, 36, 160), QColor(212, 107, 8, 255), 0.7),
+            ("Unsur Geografis", QColor(108, 142, 191, 140), QColor(29, 57, 196, 255), 0.5),
+            ("Tumpang Tindih", QColor(255, 140, 0, 180), QColor(178, 34, 34, 255), 0.9),
         ]
 
         categories = []
@@ -534,8 +593,8 @@ def apply_bhumi_symbology(layer: QgsVectorLayer):
         renderer = QgsCategorizedSymbolRenderer("status", categories)
         layer.setRenderer(renderer)
         layer.triggerRepaint()
-    except Exception:
-        pass
+    except Exception as e:
+        QgsMessageLog.logMessage(f"Gagal memasang simbologi: {e}", "BHUMI ATR/BPN", Qgis.Warning)
 
 
 def vectorize_persil_to_vector_files(
@@ -546,8 +605,8 @@ def vectorize_persil_to_vector_files(
     simplify_tolerance: float = 0.2,
 ) -> tuple[Optional[str], Optional[str], int]:
     """
-    Ekstrak bidang tanah dari raster qimage menjadi layer Poligon vektor.
-    Menyimpan sekaligus ke format Shapefile (.shp) dan GeoJSON (.geojson).
+    Ekstrak bidang tanah dari raster qimage menjadi layer Poligon vektor tertutup.
+    Menyimpan sekaligus ke format ESRI Shapefile (.shp) dan GeoJSON (.geojson).
     """
     width = qimage.width()
     height = qimage.height()
@@ -561,15 +620,15 @@ def vectorize_persil_to_vector_files(
         import numpy as np
         from osgeo import gdal, ogr, osr
 
-        img_format = QImage.Format_RGBA8888
-        converted = qimage.convertToFormat(img_format)
-        ptr = converted.bits()
-        ptr.setsize(converted.byteCount())
-        arr = np.frombuffer(bytes(ptr), dtype=np.uint8).reshape((height, width, 4))
+        arr = qimage_to_rgba_array(qimage)
+        if arr is None:
+            QgsMessageLog.logMessage("Array piksel QImage tidak dapat diekstrak.", "BHUMI ATR/BPN", Qgis.Critical)
+            return None, None, 0
 
         alpha = arr[:, :, 3]
         mask_binary = (alpha > 30).astype(np.uint8)
 
+        # Buat in-memory raster untuk Polygonize
         mem_driver = gdal.GetDriverByName("MEM")
         src_ds = mem_driver.Create("", width, height, 1, gdal.GDT_Byte)
         src_ds.SetGeoTransform([
@@ -583,8 +642,11 @@ def vectorize_persil_to_vector_files(
         band = src_ds.GetRasterBand(1)
         band.WriteArray(mask_binary)
 
-        ogr_mem_driver = ogr.GetDriverByName("Memory")
-        dst_ds = ogr_mem_driver.CreateDataSource("mem_polygons")
+        # Buat in-memory vector layer penampung hasil Polygonize
+        ogr_driver = ogr.GetDriverByName("MEM")
+        if ogr_driver is None:
+            ogr_driver = ogr.GetDriverByName("Memory")
+        dst_ds = ogr_driver.CreateDataSource("mem_polygons")
         dst_layer = dst_ds.CreateLayer("polygons", srs=srs, geom_type=ogr.wkbPolygon)
 
         field_dn = ogr.FieldDefn("DN", ogr.OFTInteger)
@@ -608,7 +670,29 @@ def vectorize_persil_to_vector_files(
             if area < min_area_m2 or area >= (outer_bbox_area * 0.98):
                 continue
 
-            # Klasifikasikan status & warna berdasarkan legenda BHUMI
+            # Verifikasi apakah keliling poligon dikelilingi oleh garis batas (stroke lines)
+            boundary = geom.Boundary()
+            if boundary:
+                boundary_points = []
+                pt_count = boundary.GetPointCount()
+                step = max(1, pt_count // 80)
+                for i in range(0, pt_count, step):
+                    pt = boundary.GetPoint(i)
+                    px = int((pt[0] - rect_3857.xMinimum()) / res_x)
+                    py = int((rect_3857.yMaximum() - pt[1]) / res_y)
+                    px = max(0, min(px, width - 1))
+                    py = max(0, min(py, height - 1))
+                    boundary_points.append(arr[py, px])
+
+                if boundary_points:
+                    b_arr = np.array(boundary_points)
+                    stroke_hits = np.sum(b_arr[:, 3] > 30)
+                    stroke_ratio = stroke_hits / max(1, len(boundary_points))
+                    # Abaikan poligon canvas background luar yang tidak memiliki stroke pembatas
+                    if stroke_ratio < 0.5:
+                        continue
+
+            # Klasifikasikan status & warna berdasarkan legenda resmi BHUMI
             status, kode_warna, is_overlap = _classify_polygon_by_color(
                 geom, arr, rect_3857, res_x, res_y, width, height
             )
@@ -618,7 +702,7 @@ def vectorize_persil_to_vector_files(
                 if simplified_geom and not simplified_geom.IsEmpty():
                     geom = simplified_geom
 
-            perimeter = geom.Boundary().GetLength() if geom.Boundary() else 0.0
+            perimeter = geom.Boundary().Length() if geom.Boundary() else 0.0
             wkt_str = geom.ExportToWkt()
 
             valid_polygons.append({
@@ -634,13 +718,14 @@ def vectorize_persil_to_vector_files(
         dst_ds = None
 
         if not valid_polygons:
+            QgsMessageLog.logMessage("Tidak ditemukan poligon bidang tanah yang valid pada area ini.", "BHUMI ATR/BPN", Qgis.Info)
             return None, None, 0
 
         base_no_ext = os.path.splitext(base_filepath)[0]
         shp_path = f"{base_no_ext}_poligon.shp"
         geojson_path = f"{base_no_ext}_poligon.geojson"
 
-        crs_3857 = QgsCoordinateReferenceSystem("EPSG:3857")
+        # Buat temporary QgsVectorLayer untuk diekspor
         vl = QgsVectorLayer("Polygon?crs=EPSG:3857", "persil_temp", "memory")
         pr = vl.dataProvider()
 
@@ -672,7 +757,7 @@ def vectorize_persil_to_vector_files(
         pr.addFeatures(qgs_features)
         vl.updateExtents()
 
-        # 1. Simpan ke ESRI Shapefile
+        # 1. Simpan ke ESRI Shapefile (.shp)
         options_shp = QgsVectorFileWriter.SaveVectorOptions()
         options_shp.driverName = "ESRI Shapefile"
         options_shp.fileEncoding = "UTF-8"
@@ -680,7 +765,7 @@ def vectorize_persil_to_vector_files(
             vl, shp_path, QgsProject.instance().transformContext(), options_shp
         )
 
-        # 2. Simpan ke GeoJSON
+        # 2. Simpan ke GeoJSON (.geojson)
         options_geojson = QgsVectorFileWriter.SaveVectorOptions()
         options_geojson.driverName = "GeoJSON"
         options_geojson.fileEncoding = "UTF-8"
@@ -688,9 +773,16 @@ def vectorize_persil_to_vector_files(
             vl, geojson_path, QgsProject.instance().transformContext(), options_geojson
         )
 
+        QgsMessageLog.logMessage(
+            f"Sukses vektorisasi {len(valid_polygons)} bidang tanah: {shp_path} & {geojson_path}",
+            "BHUMI ATR/BPN",
+            Qgis.Success,
+        )
+
         return shp_path, geojson_path, len(valid_polygons)
 
-    except Exception:
+    except Exception as e:
+        QgsMessageLog.logMessage(f"Kesalahan proses vektorisasi: {e}", "BHUMI ATR/BPN", Qgis.Critical)
         return None, None, 0
 
 
