@@ -472,91 +472,97 @@ def _write_world_files(filepath: str, rect_3857: QgsRectangle, res_x: float, res
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mesin Klasifikasi Warna & Vektorisasi Berbasis Legenda BHUMI
+# Tabel Warna Resmi Legenda BHUMI ATR/BPN
+# (status, rgb_center_arr, tolerance_euklidean, kode_warna)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _classify_polygon_by_color(
-    geom,
-    rgba_arr,
-    rect_3857: QgsRectangle,
-    res_x: float,
-    res_y: float,
-    img_w: int,
-    img_h: int,
-) -> tuple[str, str, str]:
+import numpy as _np_color_table
+
+BHUMI_COLOR_TABLE = [
+    # Urutan penting: warna yang lebih spesifik/jarang duluan
+    ("Hak Pengelolaan",   _np_color_table.array([220,  40,  40], dtype=_np_color_table.float32), 55, "#FF0000"),
+    ("Belum Terdaftar",   _np_color_table.array([129, 199, 132], dtype=_np_color_table.float32), 50, "#81C784"),
+    ("Unsur Geografis",   _np_color_table.array([108, 142, 191], dtype=_np_color_table.float32), 50, "#6C8EBF"),
+    ("Kawasan Terdaftar", _np_color_table.array([229, 160,  36], dtype=_np_color_table.float32), 45, "#E5A024"),
+    ("Bidang Terdaftar",  _np_color_table.array([245, 194,  88], dtype=_np_color_table.float32), 55, "#F5C258"),
+]
+
+
+def _color_distance_mask(
+    rgb_arr,
+    center_rgb,
+    alpha_arr,
+    tolerance: float,
+    min_alpha: int = 80,
+):
     """
-    Klasifikasikan poligon berdasarkan sampel warna piksel boundary garis batas & interior.
-    :returns: (status, kode_warna, is_overlap)
+    Buat binary mask piksel yang berada dalam jarak Euclidean < tolerance
+    dari center_rgb (numpy float32 array [R,G,B]).
+    Hanya piksel dengan alpha >= min_alpha yang dilibatkan.
     """
     import numpy as np
+    diff = rgb_arr.astype(np.float32) - center_rgb
+    dist = np.sqrt(np.sum(diff ** 2, axis=2))
+    return ((dist <= tolerance) & (alpha_arr >= min_alpha)).astype(np.uint8)
 
+
+def _smooth_mask(mask, close_iter: int = 2, open_iter: int = 1):
+    """
+    Haluskan binary mask menggunakan operasi morfologis (closing + opening).
+    Closing = menutup celah kecil & meratakan cekungan di luar.
+    Opening = menghilangkan tonjolan / noise piksel kecil.
+    Menghasilkan tepian raster lebih mulus sebelum Polygonize.
+    """
+    import numpy as np
     try:
-        # 1. Sampel warna pada garis batas keliling (Boundary stroke)
-        boundary = geom.Boundary()
-        boundary_points = []
-        if boundary:
-            pt_count = boundary.GetPointCount()
-            step = max(1, pt_count // 60)
-            for i in range(0, pt_count, step):
-                pt = boundary.GetPoint(i)
-                px = int((pt[0] - rect_3857.xMinimum()) / res_x)
-                py = int((rect_3857.yMaximum() - pt[1]) / res_y)
-                px = max(0, min(px, img_w - 1))
-                py = max(0, min(py, img_h - 1))
-                boundary_points.append(rgba_arr[py, px])
+        from scipy.ndimage import binary_closing, binary_opening
+        struct = np.ones((3, 3), dtype=bool)
+        m = binary_closing(mask.astype(bool), structure=struct, iterations=close_iter)
+        m = binary_opening(m, structure=struct, iterations=open_iter)
+        return m.astype(np.uint8)
+    except ImportError:
+        return mask.astype(np.uint8)
 
-        sr, sg, sb, sa = 0, 0, 0, 0
-        if boundary_points:
-            b_arr = np.array(boundary_points)
-            stroke_hits = b_arr[b_arr[:, 3] > 30]
-            if len(stroke_hits) > 0:
-                median_stroke = np.median(stroke_hits, axis=0)
-                sr, sg, sb, sa = median_stroke[0], median_stroke[1], median_stroke[2], median_stroke[3]
 
-        # 2. Sampel warna interior di sekitar centroid
-        centroid = geom.Centroid()
-        ir, ig, ib, ia = 0, 0, 0, 0
-        if centroid is not None:
-            cx = centroid.GetX()
-            cy = centroid.GetY()
-            cpx = max(0, min(int((cx - rect_3857.xMinimum()) / res_x), img_w - 1))
-            cpy = max(0, min(int((rect_3857.yMaximum() - cy) / res_y), img_h - 1))
+def _polygonize_mask(mask, geotransform, srs_wkt: str):
+    """
+    Polygonize binary mask menggunakan GDAL (in-memory).
+    Mengembalikan list (geom_clone, area) untuk semua poligon dengan DN == 1.
+    """
+    from osgeo import gdal, ogr, osr
+    import numpy as np
 
-            samples = []
-            for dx in range(-2, 3):
-                for dy in range(-2, 3):
-                    sx = max(0, min(cpx + dx, img_w - 1))
-                    sy = max(0, min(cpy + dy, img_h - 1))
-                    samples.append(rgba_arr[sy, sx])
-            samples_arr = np.array(samples)
-            median_rgb = np.median(samples_arr[:, :3], axis=0)
-            ir, ig, ib = median_rgb[0], median_rgb[1], median_rgb[2]
+    h, w = mask.shape
+    mem_driver = gdal.GetDriverByName("MEM")
+    src_ds = mem_driver.Create("", w, h, 1, gdal.GDT_Byte)
+    src_ds.SetGeoTransform(geotransform)
+    src_ds.SetProjection(srs_wkt)
+    src_ds.GetRasterBand(1).WriteArray(mask)
 
-        # ── Evaluasi Kategori Legenda BHUMI ATR/BPN ──
-        # A. Hak Pengelolaan (Garis / Area Merah Pekat)
-        if (sr > 190 and sg < 70 and sb < 70) or (ir > 190 and ig < 70 and ib < 70):
-            return "Hak Pengelolaan", "#FF0000", "Tidak"
+    ogr_driver = ogr.GetDriverByName("MEM")
+    if ogr_driver is None:
+        ogr_driver = ogr.GetDriverByName("Memory")
 
-        # B. Belum Terdaftar (Garis / Area Hijau)
-        if (sg > sr + 15 and sg > sb + 15) or (sg > 140 and sr < 160 and sb < 160) or (ig > ir + 15 and ig > ib + 15):
-            return "Belum Terdaftar", "#81C784", "Tidak"
+    srs = osr.SpatialReference()
+    srs.ImportFromWkt(srs_wkt)
 
-        # C. Unsur Geografis (Garis / Area Biru)
-        if (sb > sr + 15 and sb > sg + 10) or (sb > 150 and sr < 140) or (ib > ir + 15 and ib > ig + 10):
-            return "Unsur Geografis", "#6C8EBF", "Tidak"
+    dst_ds = ogr_driver.CreateDataSource("tmp")
+    dst_layer = dst_ds.CreateLayer("p", srs=srs, geom_type=ogr.wkbPolygon)
+    dst_layer.CreateField(ogr.FieldDefn("DN", ogr.OFTInteger))
 
-        # D. Bidang Terdaftar (Kuning Standar ATR/BPN: R > 190, G > 160)
-        if (ir > 190 and ig > 160) or (sr > 190 and sg > 160):
-            return "Bidang Terdaftar", "#F5C258", "Tidak"
+    gdal.Polygonize(src_ds.GetRasterBand(1), None, dst_layer, 0, [], callback=None)
 
-        # E. Kawasan Terdaftar / Tumpang Tindih (Kuning Emas Pekat / Oranye Coklat)
-        if (sr > 200 and 110 <= sg <= 185 and sb < 80) or (ir > 190 and 110 <= ig <= 185 and ib < 80):
-            return "Kawasan Terdaftar", "#E5A024", "Ya"
+    results = []
+    for feat in dst_layer:
+        if feat.GetField("DN") != 1:
+            continue
+        geom = feat.GetGeometryRef()
+        if geom:
+            results.append((geom.Clone(), geom.GetArea()))
 
-    except Exception:
-        pass
-
-    return "Bidang Terdaftar", "#F5C258", "Tidak"
+    src_ds = None
+    dst_ds = None
+    return results
 
 
 def apply_bhumi_symbology(layer: QgsVectorLayer):
@@ -572,12 +578,12 @@ def apply_bhumi_symbology(layer: QgsVectorLayer):
         )
 
         categories_def = [
-            ("Bidang Terdaftar", QColor(245, 194, 88, 140), QColor(212, 136, 6, 255), 0.5),
-            ("Belum Terdaftar", QColor(129, 199, 132, 150), QColor(56, 142, 60, 255), 0.5),
-            ("Hak Pengelolaan", QColor(255, 0, 0, 40), QColor(255, 0, 0, 255), 1.2),
-            ("Kawasan Terdaftar", QColor(229, 160, 36, 160), QColor(212, 107, 8, 255), 0.7),
-            ("Unsur Geografis", QColor(108, 142, 191, 140), QColor(29, 57, 196, 255), 0.5),
-            ("Tumpang Tindih", QColor(255, 140, 0, 180), QColor(178, 34, 34, 255), 0.9),
+            ("Bidang Terdaftar", QColor(245, 194, 88, 140),  QColor(212, 136,  6, 255), 0.5),
+            ("Belum Terdaftar",  QColor(129, 199, 132, 150), QColor( 56, 142, 60, 255), 0.5),
+            ("Hak Pengelolaan",  QColor(255,   0,   0,  40), QColor(255,   0,  0, 255), 1.2),
+            ("Kawasan Terdaftar",QColor(229, 160,  36, 160), QColor(212, 107,  8, 255), 0.7),
+            ("Unsur Geografis",  QColor(108, 142, 191, 140), QColor( 29,  57,196, 255), 0.5),
+            ("Tumpang Tindih",   QColor(255, 140,   0, 200), QColor(178,  34, 34, 255), 1.0),
         ]
 
         categories = []
@@ -602,12 +608,26 @@ def vectorize_persil_to_vector_files(
     rect_3857: QgsRectangle,
     base_filepath: str,
     min_area_m2: float = 8.0,
-    simplify_tolerance: float = 0.2,
+    simplify_tolerance: float = 0.0,   # 0 = gunakan adaptive
 ) -> tuple[Optional[str], Optional[str], int]:
     """
-    Ekstrak bidang tanah dari raster qimage menjadi layer Poligon vektor tertutup.
-    Menyimpan sekaligus ke format ESRI Shapefile (.shp) dan GeoJSON (.geojson).
+    Vektorisasi raster persil BHUMI ke layer Poligon per kategori legenda.
+
+    Algoritma baru (v3):
+      1. Untuk setiap kategori warna BHUMI (Bidang Terdaftar, Belum Terdaftar, dll):
+         a. Buat binary mask piksel yang warnanya cocok (Euclidean RGB distance)
+         b. Morfologi-close/open untuk memperhalus tepian (anti-staircase)
+         c. GDAL Polygonize → hasilkan poligon per kategori
+         d. Simplifikasi adaptif: tolerance = 10 × resolusi piksel (meter/px)
+      2. Deteksi Tumpang Tindih:
+         Cek interseksi geometri antar poligon beda kategori.
+         Area tumpang tindih > min_area_m2 → tandai is_overlap = "Ya"
+         dan tambahkan poligon zona tumpang tindih terpisah.
+      3. Export simultan ke SHP dan GeoJSON.
     """
+    import numpy as np
+    from osgeo import gdal, ogr, osr
+
     width = qimage.width()
     height = qimage.height()
     if width <= 0 or height <= 0:
@@ -616,152 +636,186 @@ def vectorize_persil_to_vector_files(
     res_x = rect_3857.width() / float(width)
     res_y = rect_3857.height() / float(height)
 
-    try:
-        import numpy as np
-        from osgeo import gdal, ogr, osr
+    # Toleransi simplifikasi adaptif: 10 piksel × resolusi dunia
+    adapt_tol = max(res_x, res_y) * 10.0
+    if simplify_tolerance > 0:
+        adapt_tol = simplify_tolerance
 
+    outer_bbox_area = rect_3857.width() * rect_3857.height()
+
+    geotransform = [
+        rect_3857.xMinimum(), res_x, 0.0,
+        rect_3857.yMaximum(), 0.0, -res_y,
+    ]
+
+    srs_obj = osr.SpatialReference()
+    srs_obj.ImportFromEPSG(3857)
+    srs_wkt = srs_obj.ExportToWkt()
+
+    try:
         arr = qimage_to_rgba_array(qimage)
         if arr is None:
-            QgsMessageLog.logMessage("Array piksel QImage tidak dapat diekstrak.", "BHUMI ATR/BPN", Qgis.Critical)
-            return None, None, 0
-
-        alpha = arr[:, :, 3]
-        mask_binary = (alpha > 30).astype(np.uint8)
-
-        # Buat in-memory raster untuk Polygonize
-        mem_driver = gdal.GetDriverByName("MEM")
-        src_ds = mem_driver.Create("", width, height, 1, gdal.GDT_Byte)
-        src_ds.SetGeoTransform([
-            rect_3857.xMinimum(), res_x, 0.0,
-            rect_3857.yMaximum(), 0.0, -res_y
-        ])
-        srs = osr.SpatialReference()
-        srs.ImportFromEPSG(3857)
-        src_ds.SetProjection(srs.ExportToWkt())
-
-        band = src_ds.GetRasterBand(1)
-        band.WriteArray(mask_binary)
-
-        # Buat in-memory vector layer penampung hasil Polygonize
-        ogr_driver = ogr.GetDriverByName("MEM")
-        if ogr_driver is None:
-            ogr_driver = ogr.GetDriverByName("Memory")
-        dst_ds = ogr_driver.CreateDataSource("mem_polygons")
-        dst_layer = dst_ds.CreateLayer("polygons", srs=srs, geom_type=ogr.wkbPolygon)
-
-        field_dn = ogr.FieldDefn("DN", ogr.OFTInteger)
-        dst_layer.CreateField(field_dn)
-
-        gdal.Polygonize(band, None, dst_layer, 0, [], callback=None)
-
-        valid_polygons = []
-        outer_bbox_area = rect_3857.width() * rect_3857.height()
-
-        for feat in dst_layer:
-            dn_val = feat.GetField("DN")
-            # Ambil DN == 1 (area bidang tanah yang memiliki piksel warna / non-transparan)
-            if dn_val != 1:
-                continue
-
-            geom = feat.GetGeometryRef()
-            if geom is None:
-                continue
-
-            area = geom.GetArea()
-            if area < min_area_m2 or area >= (outer_bbox_area * 0.999):
-                continue
-
-            # Klasifikasikan status & warna berdasarkan legenda resmi BHUMI
-            status, kode_warna, is_overlap = _classify_polygon_by_color(
-                geom, arr, rect_3857, res_x, res_y, width, height
+            QgsMessageLog.logMessage(
+                "Array piksel QImage tidak dapat diekstrak.", "BHUMI ATR/BPN", Qgis.Critical
             )
-
-            if simplify_tolerance > 0:
-                simplified_geom = geom.Simplify(simplify_tolerance)
-                if simplified_geom and not simplified_geom.IsEmpty():
-                    geom = simplified_geom
-
-            perimeter = geom.Boundary().Length() if geom.Boundary() else 0.0
-            wkt_str = geom.ExportToWkt()
-
-            valid_polygons.append({
-                "wkt": wkt_str,
-                "status": status,
-                "is_overlap": is_overlap,
-                "kode_warna": kode_warna,
-                "area_m2": round(area, 2),
-                "perimeter_m": round(perimeter, 2),
-            })
-
-        src_ds = None
-        dst_ds = None
-
-        if not valid_polygons:
-            QgsMessageLog.logMessage("Tidak ditemukan poligon bidang tanah yang valid pada area ini.", "BHUMI ATR/BPN", Qgis.Info)
             return None, None, 0
 
+        rgb_arr = arr[:, :, :3]
+        alpha_arr = arr[:, :, 3]
+
+        all_polygons = []  # list of dict { geom (OGR), status, kode_warna, area_m2, perimeter_m }
+
+        # ── Langkah 1: Segmentasi per warna legenda ──────────────────────────
+        for status, center_rgb, tolerance, kode_warna in BHUMI_COLOR_TABLE:
+            # 1a. Buat mask warna
+            cmask = _color_distance_mask(rgb_arr, center_rgb, alpha_arr, tolerance)
+
+            if not np.any(cmask):
+                continue
+
+            # 1b. Morfologi smoothing (hilangkan staircase piksel)
+            cmask = _smooth_mask(cmask, close_iter=2, open_iter=1)
+
+            if not np.any(cmask):
+                continue
+
+            # 1c. Polygonize mask kategori ini
+            polys = _polygonize_mask(cmask, geotransform, srs_wkt)
+
+            for geom, area in polys:
+                if area < min_area_m2 or area >= outer_bbox_area * 0.999:
+                    geom.Destroy() if hasattr(geom, 'Destroy') else None
+                    continue
+
+                # 1d. Simplifikasi adaptif
+                simplified = geom.Simplify(adapt_tol)
+                if not simplified or simplified.IsEmpty():
+                    simplified = geom
+                    geom = None
+                else:
+                    geom = None
+
+                perimeter = simplified.Boundary().Length() if simplified.Boundary() else 0.0
+
+                all_polygons.append({
+                    "geom": simplified,
+                    "status": status,
+                    "is_overlap": "Tidak",
+                    "kode_warna": kode_warna,
+                    "area_m2": round(area, 2),
+                    "perimeter_m": round(perimeter, 2),
+                })
+
+        if not all_polygons:
+            QgsMessageLog.logMessage(
+                "Tidak ditemukan poligon bidang tanah yang valid pada area ini.",
+                "BHUMI ATR/BPN", Qgis.Info,
+            )
+            return None, None, 0
+
+        # ── Langkah 2: Deteksi Tumpang Tindih antar poligon ──────────────────
+        overlap_zones = []
+        n = len(all_polygons)
+        for i in range(n):
+            for j in range(i + 1, n):
+                p1 = all_polygons[i]
+                p2 = all_polygons[j]
+                if p1["status"] == p2["status"]:
+                    continue
+                try:
+                    g1 = p1["geom"]
+                    g2 = p2["geom"]
+                    if not g1.Intersects(g2):
+                        continue
+                    inter = g1.Intersection(g2)
+                    if inter is None or inter.IsEmpty():
+                        continue
+                    inter_area = inter.GetArea()
+                    if inter_area < min_area_m2:
+                        continue
+                    # Tandai kedua poligon sebagai overlap
+                    p1["is_overlap"] = "Ya"
+                    p2["is_overlap"] = "Ya"
+                    # Tambahkan poligon zona overlap tersendiri
+                    simp_inter = inter.Simplify(adapt_tol)
+                    if not simp_inter or simp_inter.IsEmpty():
+                        simp_inter = inter
+                    overlap_zones.append({
+                        "geom": simp_inter,
+                        "status": "Tumpang Tindih",
+                        "is_overlap": "Ya",
+                        "kode_warna": "#FF8C00",
+                        "area_m2": round(inter_area, 2),
+                        "perimeter_m": round(
+                            simp_inter.Boundary().Length() if simp_inter.Boundary() else 0.0, 2
+                        ),
+                    })
+                except Exception:
+                    pass
+
+        all_polygons.extend(overlap_zones)
+
+        # ── Langkah 3: Build QgsVectorLayer dan ekspor ────────────────────────
         base_no_ext = os.path.splitext(base_filepath)[0]
         shp_path = f"{base_no_ext}_poligon.shp"
         geojson_path = f"{base_no_ext}_poligon.geojson"
 
-        # Buat temporary QgsVectorLayer untuk diekspor
         vl = QgsVectorLayer("Polygon?crs=EPSG:3857", "persil_temp", "memory")
         pr = vl.dataProvider()
-
         pr.addAttributes([
-            QgsField("id", QVariant.Int),
-            QgsField("status", QVariant.String),
-            QgsField("is_overlap", QVariant.String),
-            QgsField("luas_m2", QVariant.Double),
-            QgsField("keliling_m", QVariant.Double),
-            QgsField("kode_warna", QVariant.String),
-            QgsField("sumber", QVariant.String),
+            QgsField("id",          QVariant.Int),
+            QgsField("status",      QVariant.String),
+            QgsField("is_overlap",  QVariant.String),
+            QgsField("luas_m2",     QVariant.Double),
+            QgsField("keliling_m",  QVariant.Double),
+            QgsField("kode_warna",  QVariant.String),
+            QgsField("sumber",      QVariant.String),
         ])
         vl.updateFields()
 
         qgs_features = []
-        for idx, p in enumerate(valid_polygons, start=1):
+        for idx, p in enumerate(all_polygons, start=1):
             f = QgsFeature(vl.fields())
-            geom_qgs = QgsGeometry.fromWkt(p["wkt"])
-            f.setGeometry(geom_qgs)
-            f.setAttribute("id", idx)
-            f.setAttribute("status", p["status"])
+            f.setGeometry(QgsGeometry.fromWkt(p["geom"].ExportToWkt()))
+            f.setAttribute("id",         idx)
+            f.setAttribute("status",     p["status"])
             f.setAttribute("is_overlap", p["is_overlap"])
-            f.setAttribute("luas_m2", p["area_m2"])
+            f.setAttribute("luas_m2",    p["area_m2"])
             f.setAttribute("keliling_m", p["perimeter_m"])
             f.setAttribute("kode_warna", p["kode_warna"])
-            f.setAttribute("sumber", "BHUMI ATR/BPN")
+            f.setAttribute("sumber",     "BHUMI ATR/BPN")
             qgs_features.append(f)
 
         pr.addFeatures(qgs_features)
         vl.updateExtents()
 
-        # 1. Simpan ke ESRI Shapefile (.shp)
-        options_shp = QgsVectorFileWriter.SaveVectorOptions()
-        options_shp.driverName = "ESRI Shapefile"
-        options_shp.fileEncoding = "UTF-8"
+        # Simpan ke SHP
+        opts_shp = QgsVectorFileWriter.SaveVectorOptions()
+        opts_shp.driverName = "ESRI Shapefile"
+        opts_shp.fileEncoding = "UTF-8"
         QgsVectorFileWriter.writeAsVectorFormatV3(
-            vl, shp_path, QgsProject.instance().transformContext(), options_shp
+            vl, shp_path, QgsProject.instance().transformContext(), opts_shp
         )
 
-        # 2. Simpan ke GeoJSON (.geojson)
-        options_geojson = QgsVectorFileWriter.SaveVectorOptions()
-        options_geojson.driverName = "GeoJSON"
-        options_geojson.fileEncoding = "UTF-8"
+        # Simpan ke GeoJSON
+        opts_geo = QgsVectorFileWriter.SaveVectorOptions()
+        opts_geo.driverName = "GeoJSON"
+        opts_geo.fileEncoding = "UTF-8"
         QgsVectorFileWriter.writeAsVectorFormatV3(
-            vl, geojson_path, QgsProject.instance().transformContext(), options_geojson
+            vl, geojson_path, QgsProject.instance().transformContext(), opts_geo
         )
 
         QgsMessageLog.logMessage(
-            f"Sukses vektorisasi {len(valid_polygons)} bidang tanah: {shp_path} & {geojson_path}",
+            f"Vektorisasi selesai: {len(all_polygons)} poligon "
+            f"({len(overlap_zones)} zona tumpang tindih)  →  {shp_path}",
             "BHUMI ATR/BPN",
             Qgis.Success,
         )
 
-        return shp_path, geojson_path, len(valid_polygons)
+        return shp_path, geojson_path, len(all_polygons)
 
     except Exception as e:
-        QgsMessageLog.logMessage(f"Kesalahan proses vektorisasi: {e}", "BHUMI ATR/BPN", Qgis.Critical)
+        QgsMessageLog.logMessage(f"Kesalahan vektorisasi: {e}", "BHUMI ATR/BPN", Qgis.Critical)
         return None, None, 0
 
 
