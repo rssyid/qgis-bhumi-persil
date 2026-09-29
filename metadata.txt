@@ -1,0 +1,16 @@
+[general]
+name=BHUMI Persil Connector
+qgisMinimumVersion=3.22
+description=Menampilkan bidang tanah BHUMI ATR/BPN via local proxy server berkecepatan tinggi dengan RAM caching dan export GeoTIFF georeference.
+version=2.0.0
+author=rssyid
+email=developer@gis.local
+about=Plugin untuk memuat bidang tanah BHUMI ATR/BPN secara instan ke QGIS. Dilengkapi multi-threaded turbo tile downloader, RAM cache 24 jam dengan zoom-out persistence, dan export area terpilih ke GeoTIFF georeference (EPSG:3857).
+category=Raster
+tags=bhumi, atrbpn, persil, wms, proxy, bidang tanah, geotiff, georeference
+homepage=https://github.com/rssyid/qgis-bhumi-persil
+tracker=https://github.com/rssyid/qgis-bhumi-persil/issues
+repository=https://github.com/rssyid/qgis-bhumi-persil
+experimental=False
+deprecated=False
+icon=resources/icon.png
