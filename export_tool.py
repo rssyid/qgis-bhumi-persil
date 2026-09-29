@@ -423,8 +423,120 @@ def _write_world_files(filepath: str, rect_3857: QgsRectangle, res_x: float, res
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mesin Vektorisasi: Raster Mask -> Poligon Vektor (.shp & .geojson)
+# Mesin Klasifikasi Warna & Vektorisasi Berbasis Legenda BHUMI
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _classify_polygon_by_color(
+    geom,
+    rgba_arr,
+    rect_3857: QgsRectangle,
+    res_x: float,
+    res_y: float,
+    img_w: int,
+    img_h: int,
+) -> tuple[str, str, str]:
+    """
+    Klasifikasikan poligon berdasarkan sampel warna piksel interior & boundary.
+    :returns: (status, kode_warna, is_overlap)
+    """
+    try:
+        # Ambil centroid poligon
+        centroid = geom.Centroid()
+        if centroid is None:
+            return "Bidang Terdaftar", "#F5C258", "Tidak"
+
+        cx = centroid.GetX()
+        cy = centroid.GetY()
+
+        # Konversi koordinat dunia EPSG:3857 ke koordinat piksel
+        px = int((cx - rect_3857.xMinimum()) / res_x)
+        py = int((rect_3857.yMaximum() - cy) / res_y)
+
+        # Kumpulkan sampel piksel interior (area 5x5 di sekitar centroid)
+        samples = []
+        for dx in range(-3, 4):
+            for dy in range(-3, 4):
+                sx = max(0, min(px + dx, img_w - 1))
+                sy = max(0, min(py + dy, img_h - 1))
+                samples.append(rgba_arr[sy, sx])
+
+        import numpy as np
+        samples_arr = np.array(samples)
+        median_rgb = np.median(samples_arr[:, :3], axis=0)
+        r, g, b = median_rgb[0], median_rgb[1], median_rgb[2]
+
+        # Cek sampel boundary garis batas terdekat
+        env = geom.GetEnvelope()
+        min_px = max(0, int((env[0] - rect_3857.xMinimum()) / res_x))
+        max_py = min(img_h - 1, int((rect_3857.yMaximum() - env[2]) / res_y))
+        stroke_sample = rgba_arr[max_py, min_px]
+        sr, sg, sb, sa = stroke_sample
+
+        # 1. Hak Pengelolaan (Garis Merah Pekat)
+        if (sr > 190 and sg < 60 and sb < 60) or (r > 190 and g < 60 and b < 60):
+            return "Hak Pengelolaan", "#FF0000", "Tidak"
+
+        # 2. Belum Terdaftar (Hijau)
+        if (g > r + 15 and g > b + 15) or (g > 140 and r < 160 and b < 160):
+            return "Belum Terdaftar", "#81C784", "Tidak"
+
+        # 3. Unsur Geografis (Biru / Cyan)
+        if (b > r + 15 and b > g + 10) or (b > 150 and r < 140):
+            return "Unsur Geografis", "#6C8EBF", "Tidak"
+
+        # 4. Kawasan Terdaftar / Tumpang Tindih (Kuning Emas Pekat / Oranye)
+        if r > 210 and 130 <= g <= 185 and b < 80:
+            return "Kawasan Terdaftar", "#E5A024", "Ya"
+
+        # 5. Bidang Terdaftar (Kuning Standar)
+        if r > 200 and g > 165:
+            return "Bidang Terdaftar", "#F5C258", "Tidak"
+
+    except Exception:
+        pass
+
+    return "Bidang Terdaftar", "#F5C258", "Tidak"
+
+
+def apply_bhumi_symbology(layer: QgsVectorLayer):
+    """
+    Pasang simbologi otomatis (Categorized Renderer) pada layer vektor
+    sesuai warna resmi legenda BHUMI ATR/BPN.
+    """
+    try:
+        from qgis.core import (
+            QgsCategorizedSymbolRenderer,
+            QgsFillSymbol,
+            QgsRendererCategory,
+            QgsSimpleFillSymbolLayer,
+            QgsSymbol,
+        )
+
+        categories_def = [
+            ("Bidang Terdaftar", QColor(245, 194, 88, 150), QColor(212, 136, 6, 255), 0.4),
+            ("Belum Terdaftar", QColor(129, 199, 132, 160), QColor(56, 142, 60, 255), 0.4),
+            ("Hak Pengelolaan", QColor(255, 0, 0, 40), QColor(255, 0, 0, 255), 1.2),
+            ("Kawasan Terdaftar", QColor(229, 160, 36, 160), QColor(212, 107, 8, 255), 0.6),
+            ("Unsur Geografis", QColor(108, 142, 191, 150), QColor(29, 57, 196, 255), 0.4),
+            ("Tumpang Tindih", QColor(255, 140, 0, 180), QColor(178, 34, 34, 255), 0.8),
+        ]
+
+        categories = []
+        for val, fill_col, stroke_col, stroke_w in categories_def:
+            symbol = QgsFillSymbol.createSimple({
+                "color": f"{fill_col.red()},{fill_col.green()},{fill_col.blue()},{fill_col.alpha()}",
+                "outline_color": f"{stroke_col.red()},{stroke_col.green()},{stroke_col.blue()},{stroke_col.alpha()}",
+                "outline_width": str(stroke_w),
+            })
+            cat = QgsRendererCategory(val, symbol, val)
+            categories.append(cat)
+
+        renderer = QgsCategorizedSymbolRenderer("status", categories)
+        layer.setRenderer(renderer)
+        layer.triggerRepaint()
+    except Exception:
+        pass
+
 
 def vectorize_persil_to_vector_files(
     qimage: QImage,
@@ -435,11 +547,7 @@ def vectorize_persil_to_vector_files(
 ) -> tuple[Optional[str], Optional[str], int]:
     """
     Ekstrak bidang tanah dari raster qimage menjadi layer Poligon vektor.
-    Menyimpan sekaligus ke format:
-      1. Shapefile (.shp + .dbf + .shx + .prj)
-      2. GeoJSON (.geojson)
-
-    :returns: (shp_path, geojson_path, polygon_count)
+    Menyimpan sekaligus ke format Shapefile (.shp) dan GeoJSON (.geojson).
     """
     width = qimage.width()
     height = qimage.height()
@@ -449,24 +557,19 @@ def vectorize_persil_to_vector_files(
     res_x = rect_3857.width() / float(width)
     res_y = rect_3857.height() / float(height)
 
-    # 1. Bangun binary mask (0 = Bidang Tanah Interior, 1 = Garis Batas / Boundary)
     try:
         import numpy as np
         from osgeo import gdal, ogr, osr
 
-        # Ambil alpha & warna dari QImage
         img_format = QImage.Format_RGBA8888
         converted = qimage.convertToFormat(img_format)
         ptr = converted.bits()
         ptr.setsize(converted.byteCount())
         arr = np.frombuffer(bytes(ptr), dtype=np.uint8).reshape((height, width, 4))
 
-        # Alpha > 30 menunjukkan adanya garis batas bidang
         alpha = arr[:, :, 3]
-        # Mask: 0 = interior bidang tanah (ruang kosong di dalam bidang), 1 = garis
         mask_binary = (alpha > 30).astype(np.uint8)
 
-        # Buat GDAL In-Memory Dataset
         mem_driver = gdal.GetDriverByName("MEM")
         src_ds = mem_driver.Create("", width, height, 1, gdal.GDT_Byte)
         src_ds.SetGeoTransform([
@@ -480,7 +583,6 @@ def vectorize_persil_to_vector_files(
         band = src_ds.GetRasterBand(1)
         band.WriteArray(mask_binary)
 
-        # Buat In-Memory OGR Vector Layer untuk menampung hasil polygonize
         ogr_mem_driver = ogr.GetDriverByName("Memory")
         dst_ds = ogr_mem_driver.CreateDataSource("mem_polygons")
         dst_layer = dst_ds.CreateLayer("polygons", srs=srs, geom_type=ogr.wkbPolygon)
@@ -488,28 +590,29 @@ def vectorize_persil_to_vector_files(
         field_dn = ogr.FieldDefn("DN", ogr.OFTInteger)
         dst_layer.CreateField(field_dn)
 
-        # Jalankan GDAL Polygonize C++ engine
         gdal.Polygonize(band, None, dst_layer, 0, [], callback=None)
 
-        # Kumpulkan poligon bidang tanah valid (DN == 0)
         valid_polygons = []
         outer_bbox_area = rect_3857.width() * rect_3857.height()
 
         for feat in dst_layer:
             dn_val = feat.GetField("DN")
             if dn_val != 0:
-                continue  # Lewati garis pembatas
+                continue
 
             geom = feat.GetGeometryRef()
             if geom is None:
                 continue
 
             area = geom.GetArea()
-            # Filter noise kecil dan abaikan poligon raksasa seukuran seluruh kanvas
             if area < min_area_m2 or area >= (outer_bbox_area * 0.98):
                 continue
 
-            # Simplifikasi geometri agar tidak bergerigi
+            # Klasifikasikan status & warna berdasarkan legenda BHUMI
+            status, kode_warna, is_overlap = _classify_polygon_by_color(
+                geom, arr, rect_3857, res_x, res_y, width, height
+            )
+
             if simplify_tolerance > 0:
                 simplified_geom = geom.Simplify(simplify_tolerance)
                 if simplified_geom and not simplified_geom.IsEmpty():
@@ -520,6 +623,9 @@ def vectorize_persil_to_vector_files(
 
             valid_polygons.append({
                 "wkt": wkt_str,
+                "status": status,
+                "is_overlap": is_overlap,
+                "kode_warna": kode_warna,
                 "area_m2": round(area, 2),
                 "perimeter_m": round(perimeter, 2),
             })
@@ -530,34 +636,36 @@ def vectorize_persil_to_vector_files(
         if not valid_polygons:
             return None, None, 0
 
-        # Tentukan nama file output .shp dan .geojson
         base_no_ext = os.path.splitext(base_filepath)[0]
         shp_path = f"{base_no_ext}_poligon.shp"
         geojson_path = f"{base_no_ext}_poligon.geojson"
 
-        # Buat Layer Vektor menggunakan QGIS API untuk export Shapefile & GeoJSON
         crs_3857 = QgsCoordinateReferenceSystem("EPSG:3857")
         vl = QgsVectorLayer("Polygon?crs=EPSG:3857", "persil_temp", "memory")
         pr = vl.dataProvider()
 
-        # Tambahkan atribut
         pr.addAttributes([
             QgsField("id", QVariant.Int),
+            QgsField("status", QVariant.String),
+            QgsField("is_overlap", QVariant.String),
             QgsField("luas_m2", QVariant.Double),
             QgsField("keliling_m", QVariant.Double),
+            QgsField("kode_warna", QVariant.String),
             QgsField("sumber", QVariant.String),
         ])
         vl.updateFields()
 
-        # Masukkan fitur poligon
         qgs_features = []
         for idx, p in enumerate(valid_polygons, start=1):
             f = QgsFeature(vl.fields())
             geom_qgs = QgsGeometry.fromWkt(p["wkt"])
             f.setGeometry(geom_qgs)
             f.setAttribute("id", idx)
+            f.setAttribute("status", p["status"])
+            f.setAttribute("is_overlap", p["is_overlap"])
             f.setAttribute("luas_m2", p["area_m2"])
             f.setAttribute("keliling_m", p["perimeter_m"])
+            f.setAttribute("kode_warna", p["kode_warna"])
             f.setAttribute("sumber", "BHUMI ATR/BPN")
             qgs_features.append(f)
 
@@ -583,7 +691,6 @@ def vectorize_persil_to_vector_files(
         return shp_path, geojson_path, len(valid_polygons)
 
     except Exception:
-        # Fallback jika terjadi kendala pada GDAL C++ binding
         return None, None, 0
 
 
@@ -979,6 +1086,7 @@ class RectangleAreaTool(QgsMapTool):
                     layer_name_v = os.path.splitext(os.path.basename(shp_file))[0]
                     vector_layer = QgsVectorLayer(shp_file, layer_name_v, "ogr")
                     if vector_layer.isValid():
+                        apply_bhumi_symbology(vector_layer)
                         QgsProject.instance().addMapLayer(vector_layer)
 
             QMessageBox.information(
